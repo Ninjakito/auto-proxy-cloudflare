@@ -1,6 +1,6 @@
 services:
   auto-proxy-cloudflare:
-    image: ghcr.io/Ninjakito/auto-proxy-cloudflare:latest
+    image: ghcr.io/ninjakito/auto-proxy-cloudflare:latest
     restart: unless-stopped
     env_file:
       - .env
