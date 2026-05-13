@@ -83,7 +83,7 @@ This gives the service the minimum necessary access.
 ### Pull from GHCR
 
 ```bash
-docker pull ghcr.io/Ninjakito/auto-proxy-cloudflare:latest
+docker pull ghcr.io/ninjakito/auto-proxy-cloudflare:latest
 ```
 
 ### With Docker Compose
@@ -102,7 +102,7 @@ docker run -d \
   --name auto-proxy-cloudflare \
   --restart unless-stopped \
   --env-file .env \
-  ghcr.io/Ninjakito/auto-proxy-cloudflare:latest
+  ghcr.io/ninjakito/auto-proxy-cloudflare:latest
 ```
 
 ### Build locally
