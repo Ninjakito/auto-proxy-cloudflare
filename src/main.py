@@ -108,11 +108,21 @@ def set_proxy(zone_id: str, record_id: str, domain: str, proxied: bool) -> bool:
 # Check API
 # ---------------------------------------------------------------------------
 
+_CHECK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
 def check_domain(domain: str):
     try:
         r = requests.get(
             CHECK_API_URL,
             params={"domain": domain, "json": "1"},
+            headers=_CHECK_HEADERS,
             timeout=15,
         )
         r.raise_for_status()
