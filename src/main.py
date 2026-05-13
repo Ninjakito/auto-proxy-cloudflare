@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import signal
+import socket
 from datetime import datetime, timezone
 
 import requests
@@ -105,6 +106,18 @@ def set_proxy(zone_id: str, record_id: str, domain: str, proxied: bool) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
+# DNS helpers
+# ---------------------------------------------------------------------------
+
+def resolve_ips(domain: str) -> list:
+    try:
+        info = socket.getaddrinfo(domain, None)
+        return list({item[4][0] for item in info})
+    except Exception as e:
+        log.warning("Could not resolve IPs for %s: %s", domain, e)
+        return []
+
+# ---------------------------------------------------------------------------
 # Check API
 # ---------------------------------------------------------------------------
 
@@ -164,11 +177,38 @@ def notify_discord(domain: str, blocked: bool) -> None:
 # Per-domain state and processing
 # ---------------------------------------------------------------------------
 
-# state[domain] = {"proxied": None | True | False, "zone_id": str | None}
-# proxied=None  -> initial/unknown state
-# proxied=False -> proxy disabled by this service
-# proxied=True  -> proxy re-enabled by this service
+# state[domain] = {
+#   "proxied":     None | True | False  \u2014 None: unknown, False: disabled by us, True: enabled by us
+#   "zone_id":     str | None
+#   "proxied_ips": list  \u2014 Cloudflare anycast IPs saved the moment we disabled the proxy;
+#                          used to decide re-enable without triggering the block\u2192unblock loop
+# }
 state: dict = {}
+
+
+def _should_reenable(current: dict, blocked_ips: set) -> bool:
+    """
+    Return True only when none of the Cloudflare IPs we saved at disable-time
+    appear in the current blocked_ips list.
+
+    Avoids the infinite loop: after disabling proxy the domain resolves to its
+    real origin IP, so domain_blocked would flip to False even though the
+    Cloudflare IPs are still banned. We ignore domain_blocked for re-enable
+    decisions and check the saved IPs directly.
+    """
+    saved = set(current.get("proxied_ips", []))
+    if not saved:
+        # No saved IPs (e.g. first cycle or DNS resolution failed); stay disabled
+        # to avoid the loop. Operator can re-enable manually if needed.
+        log.warning(
+            "No saved proxy IPs to cross-check \u2014 keeping proxy disabled until IPs are known."
+        )
+        return False
+    still_blocked = saved & blocked_ips
+    if still_blocked:
+        log.debug("Proxy IPs still blocked: %s", still_blocked)
+        return False
+    return True
 
 
 def process_domain(domain: str) -> None:
@@ -177,15 +217,21 @@ def process_domain(domain: str) -> None:
         return  # API failure, will retry next cycle
 
     domain_blocked: bool = result.get("domain_blocked", False)
-    current = state.setdefault(domain, {"proxied": None, "zone_id": None})
+    blocked_ips: set = set(result.get("blocked_ips", []))
+    current = state.setdefault(domain, {"proxied": None, "zone_id": None, "proxied_ips": []})
 
     log.debug(
-        "Domain %s: blocked=%s proxy_state=%s",
-        domain, domain_blocked, current["proxied"],
+        "Domain %s: blocked=%s proxy_state=%s saved_ips=%s",
+        domain, domain_blocked, current["proxied"], current.get("proxied_ips"),
     )
 
     if domain_blocked and current["proxied"] is not False:
         log.info("Domain %s is BLOCKED by La Liga. Disabling Cloudflare proxy.", domain)
+        # Resolve and save the Cloudflare anycast IPs *before* disabling so we can
+        # track them in blocked_ips later. The domain still points to Cloudflare now.
+        if not current["proxied_ips"]:
+            current["proxied_ips"] = resolve_ips(domain)
+            log.info("Saved Cloudflare proxy IPs for %s: %s", domain, current["proxied_ips"])
         root_zone = get_root_zone(domain)
         zone_id = get_zone_id(root_zone)
         if not zone_id:
@@ -195,7 +241,6 @@ def process_domain(domain: str) -> None:
         if not records:
             log.warning("No DNS records found for %s in zone %s.", domain, zone_id)
             return
-        # Only patch records that are currently proxied
         to_patch = [rec for rec in records if rec.get("proxied", False)]
         if not to_patch:
             log.debug("All records for %s are already unproxied.", domain)
@@ -210,8 +255,12 @@ def process_domain(domain: str) -> None:
         else:
             log.error("Some records for %s could not be unproxied \u2014 will retry next cycle.", domain)
 
-    elif not domain_blocked and current["proxied"] is False:
-        log.info("Domain %s is UNBLOCKED. Re-enabling Cloudflare proxy.", domain)
+    elif current["proxied"] is False:
+        if not _should_reenable(current, blocked_ips):
+            return
+        log.info(
+            "Domain %s proxy IPs are no longer blocked. Re-enabling Cloudflare proxy.", domain
+        )
         zone_id = current.get("zone_id") or get_zone_id(get_root_zone(domain))
         if not zone_id:
             log.error("Cannot find zone ID for %s \u2014 skipping.", domain)
@@ -220,15 +269,16 @@ def process_domain(domain: str) -> None:
         if not records:
             log.warning("No DNS records found for %s in zone %s.", domain, zone_id)
             return
-        # Only patch records that are currently unproxied
         to_patch = [rec for rec in records if not rec.get("proxied", True)]
         if not to_patch:
             log.debug("All records for %s are already proxied.", domain)
             current["proxied"] = True
+            current["proxied_ips"] = []
             return
         all_ok = all(set_proxy(zone_id, rec["id"], domain, True) for rec in to_patch)
         if all_ok:
             current["proxied"] = True
+            current["proxied_ips"] = []
             notify_discord(domain, blocked=False)
         else:
             log.error("Some records for %s could not be re-proxied \u2014 will retry next cycle.", domain)
